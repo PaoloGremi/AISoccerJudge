@@ -12,11 +12,11 @@ Analisi video calcetto — pipeline completa:
 
 Requisiti:
     pip install opencv-python ultralytics requests numpy
-    ollama pull qwen2-vl
+    ollama pull qwen2.5vl:7b
     ollama serve   (in un terminale separato)
 
 Utilizzo:
-    python video_analysis.py --video partita.mp4 --fps 1 --model qwen2-vl
+    python video_analysis.py --video partita.mp4 --fps 1 --model qwen2.5vl:7b
 """
 
 import argparse
@@ -39,7 +39,7 @@ import requests
 # ──────────────────────────────────────────────
 DEFAULT_FPS_SAMPLE  = 1          # frame da analizzare al secondo
 DEFAULT_YOLO_MODEL  = "yolov8n.pt"  # nano = veloce; yolov8s.pt = più preciso
-DEFAULT_OLLAMA_MODEL = "qwen2-vl"
+DEFAULT_OLLAMA_MODEL = "qwen2.5vl:7b"
 DEFAULT_OLLAMA_URL   = "http://localhost:11434"
 CONF_THRESHOLD       = 0.4       # confidenza minima YOLO
 IOU_THRESHOLD        = 0.5       # soglia IoU ByteTrack
@@ -68,9 +68,16 @@ def log(msg: str):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def frame_to_base64(frame: np.ndarray) -> str:
-    """Converte un frame OpenCV in stringa base64 JPEG."""
-    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+def frame_to_base64(frame: np.ndarray, max_side: int = 512) -> str:
+    """
+    Converte un frame OpenCV in stringa base64 JPEG.
+    Ridimensiona a max_side px sul lato lungo per ridurre il payload.
+    """
+    h, w = frame.shape[:2]
+    if max(h, w) > max_side:
+        scale = max_side / max(h, w)
+        frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
     return base64.b64encode(buf).decode("utf-8")
 
 
@@ -324,16 +331,20 @@ COMMENTO: <testo>"""
 
 
 def evaluate_player_with_llm(player: dict, player_index: int, total_players: int,
-                               ollama_url: str, model: str) -> tuple[float, str]:
+                               ollama_url: str, model: str,
+                               max_retries: int = 3, pause_sec: float = 4.0) -> tuple[float, str]:
     """
     Invia crop + prompt a Qwen2-VL via Ollama.
+    - Immagine ridimensionata a 512px per ridurre il carico in RAM
+    - Retry automatico con backoff esponenziale su errore 500
+    - Pausa tra chiamate per lasciare tempo a Ollama di liberare la memoria
     Ritorna (voto, commento).
     """
     if player["best_crop"] is None:
         return 5.0, "Nessuna immagine disponibile per la valutazione."
 
     prompt = build_prompt(player, player_index, total_players)
-    image_b64 = frame_to_base64(player["best_crop"])
+    image_b64 = frame_to_base64(player["best_crop"], max_side=512)
 
     payload = {
         "model": model,
@@ -341,43 +352,62 @@ def evaluate_player_with_llm(player: dict, player_index: int, total_players: int
         "images": [image_b64],
         "stream": False,
         "options": {
-            "temperature": 0.3,  # bassa temperatura = risposte più consistenti
-            "num_predict": 200
+            "temperature": 0.3,
+            "num_predict": 200,
+            "num_ctx": 2048       # contesto ridotto = meno RAM
         }
     }
 
-    try:
-        resp = requests.post(
-            f"{ollama_url}/api/generate",
-            json=payload,
-            timeout=120
-        )
-        resp.raise_for_status()
-        text = resp.json().get("response", "").strip()
+    last_error = ""
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.post(
+                f"{ollama_url}/api/generate",
+                json=payload,
+                timeout=120
+            )
 
-        # Parsing risposta
-        voto = 5.0
-        commento = text
+            # 500 = Ollama sotto pressione — aspetta e riprova
+            if resp.status_code == 500:
+                wait = pause_sec * attempt  # backoff: 4s, 8s, 12s
+                log(f"    500 Server Error (tentativo {attempt}/{max_retries}) — attendo {wait:.0f}s...")
+                time.sleep(wait)
+                last_error = f"500 dopo {max_retries} tentativi"
+                continue
 
-        for line in text.split("\n"):
-            line = line.strip()
-            if line.upper().startswith("VOTO:"):
-                try:
-                    voto = float(line.split(":", 1)[1].strip().split()[0])
-                    voto = max(1.0, min(10.0, voto))  # clamp 1-10
-                except (ValueError, IndexError):
-                    pass
-            elif line.upper().startswith("COMMENTO:"):
-                commento = line.split(":", 1)[1].strip()
+            resp.raise_for_status()
+            text = resp.json().get("response", "").strip()
 
-        return voto, commento
+            # Parsing risposta
+            voto = 5.0
+            commento = text
 
-    except requests.exceptions.ConnectionError:
-        return 5.0, "Errore: Ollama non raggiungibile. Avvia con `ollama serve`."
-    except requests.exceptions.Timeout:
-        return 5.0, "Errore: timeout Ollama. Prova un modello più leggero."
-    except Exception as e:
-        return 5.0, f"Errore LLM: {e}"
+            for line in text.split("\n"):
+                line = line.strip()
+                if line.upper().startswith("VOTO:"):
+                    try:
+                        voto = float(line.split(":", 1)[1].strip().split()[0])
+                        voto = max(1.0, min(10.0, voto))
+                    except (ValueError, IndexError):
+                        pass
+                elif line.upper().startswith("COMMENTO:"):
+                    commento = line.split(":", 1)[1].strip()
+
+            # Pausa dopo ogni chiamata andata a buon fine
+            time.sleep(pause_sec)
+            return voto, commento
+
+        except requests.exceptions.ConnectionError:
+            return 5.0, "Errore: Ollama non raggiungibile. Avvia con `ollama serve`."
+        except requests.exceptions.Timeout:
+            wait = pause_sec * attempt
+            log(f"    Timeout (tentativo {attempt}/{max_retries}) — attendo {wait:.0f}s...")
+            time.sleep(wait)
+            last_error = "timeout"
+        except Exception as e:
+            return 5.0, f"Errore LLM: {e}"
+
+    return 5.0, f"Valutazione fallita dopo {max_retries} tentativi ({last_error})."
 
 
 # ──────────────────────────────────────────────
@@ -431,6 +461,59 @@ def save_results(players: list[dict], output_dir: str, video_name: str):
     return json_path, csv_path
 
 
+
+# ──────────────────────────────────────────────
+# FILTRO PER NUMERO GIOCATORI ATTESO
+# ──────────────────────────────────────────────
+def filter_by_player_count(players: list[dict], expected: int) -> list[dict]:
+    """
+    Filtra i giocatori tenendo solo i `expected` track più stabili.
+
+    Strategia:
+    1. Divide i candidati per squadra (bianca / colorata)
+    2. Prova a prendere expected//2 per squadra (es. 5+5 per una 10v10)
+    3. Se una squadra ha meno giocatori del previsto, compensa dall'altra
+    4. In caso di pareggio nella presenza, preferisce track con più frame
+
+    Questo elimina i falsi positivi (arbitro, raccattapalle, spettatori
+    entrati nell'inquadratura) che tendono ad avere presenza molto bassa.
+    """
+    if expected <= 0:
+        return players
+
+    half = expected // 2
+    odd  = expected % 2  # se dispari (es. 11), una squadra ha un giocatore in più
+
+    bianche   = [p for p in players if p["squadra"] == "bianca"]
+    colorate  = [p for p in players if p["squadra"] == "colorata"]
+    # Già ordinati per presenza_sec desc, ma ri-ordiniamo per sicurezza
+    bianche.sort(key=lambda p: (p["presenza_sec"], p["frame_count"]), reverse=True)
+    colorate.sort(key=lambda p: (p["presenza_sec"], p["frame_count"]), reverse=True)
+
+    selected_b = bianche[:half + odd]
+    selected_c = colorate[:half]
+
+    # Se una squadra è corta, prende il surplus dall'altra
+    deficit_b = (half + odd) - len(selected_b)
+    deficit_c = half - len(selected_c)
+
+    if deficit_b > 0:
+        extra = colorate[half: half + deficit_b]
+        selected_c = colorate[:half + deficit_b]
+        selected_b = bianche[:half + odd]
+    if deficit_c > 0:
+        selected_b = bianche[:half + odd + deficit_c]
+        selected_c = colorate[:half]
+
+    result = selected_b + selected_c
+    result.sort(key=lambda p: p["presenza_sec"], reverse=True)
+
+    scartati = len(players) - len(result)
+    log(f"Filtro giocatori: attesi={expected}, selezionati={len(result)} "
+        f"(bianca={len(selected_b)}, colorata={len(selected_c)}), scartati={scartati}")
+
+    return result
+
 # ──────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────
@@ -439,11 +522,13 @@ def main():
     parser.add_argument("--video",   required=True,               help="Percorso del video (.mp4/.mov)")
     parser.add_argument("--fps",     type=float, default=DEFAULT_FPS_SAMPLE,   help="Frame al secondo da analizzare (default: 1)")
     parser.add_argument("--yolo",    default=DEFAULT_YOLO_MODEL,  help="Modello YOLO (default: yolov8n.pt)")
-    parser.add_argument("--model",   default=DEFAULT_OLLAMA_MODEL, help="Modello Ollama (default: qwen2-vl)")
+    parser.add_argument("--model",   default=DEFAULT_OLLAMA_MODEL, help="Modello Ollama (default: qwen2.5vl:7b)")
     parser.add_argument("--ollama",  default=DEFAULT_OLLAMA_URL,  help="URL Ollama (default: http://localhost:11434)")
     parser.add_argument("--output",  default="output",            help="Cartella output (default: ./output)")
     parser.add_argument("--no-llm",  action="store_true",         help="Salta la valutazione LLM (solo tracking)")
     parser.add_argument("--max-players", type=int, default=20,    help="Max giocatori da valutare con LLM (default: 20)")
+    parser.add_argument("--players", type=int, default=None,
+                        help="Numero TOTALE di giocatori in campo (es. 10 per 5v5). Filtra i falsi positivi.")
     args = parser.parse_args()
 
     if not os.path.exists(args.video):
@@ -466,6 +551,14 @@ def main():
     if not players:
         log("Nessun giocatore rilevato. Verifica il video e le soglie di confidenza.")
         sys.exit(0)
+
+    # ── FILTRO per numero giocatori atteso
+    if args.players:
+        log(f"Numero giocatori atteso: {args.players} — applico filtro falsi positivi")
+        players = filter_by_player_count(players, args.players)
+        if not players:
+            log("ERRORE: nessun giocatore rimasto dopo il filtro.")
+            sys.exit(0)
 
     # Stampa riepilogo tracking
     print("\n" + "="*55)
