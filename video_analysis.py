@@ -41,7 +41,7 @@ DEFAULT_FPS_SAMPLE  = 1          # frame da analizzare al secondo
 DEFAULT_YOLO_MODEL  = "yolov8n.pt"  # nano = veloce; yolov8s.pt = più preciso
 DEFAULT_OLLAMA_MODEL = "qwen2.5vl:7b"
 DEFAULT_OLLAMA_URL   = "http://localhost:11434"
-CONF_THRESHOLD       = 0.4       # confidenza minima YOLO
+CONF_THRESHOLD       = 0.55      # confidenza minima YOLO
 IOU_THRESHOLD        = 0.5       # soglia IoU ByteTrack
 
 # ──────────────────────────────────────────────
@@ -93,52 +93,29 @@ def crop_bbox(frame: np.ndarray, bbox) -> np.ndarray:
 # ──────────────────────────────────────────────
 # STEP 1 — ESTRAZIONE FRAME
 # ──────────────────────────────────────────────
-def extract_frames(video_path: str, fps_sample: float) -> list[tuple[int, np.ndarray]]:
-    """
-    Estrae frame dal video a cadenza fps_sample.
-    Ritorna lista di (frame_number, frame).
-    """
-    log(f"Apertura video: {video_path}")
+def get_video_info(video_path: str) -> tuple[float, int, float]:
+    """Ritorna (video_fps, total_frames, duration_sec)."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise IOError(f"Impossibile aprire il video: {video_path}")
-
-    video_fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    duration_sec = total_frames / video_fps if video_fps > 0 else 0
-
-    log(f"Video: {video_fps:.1f} fps, {total_frames} frame totali, {duration_sec:.0f}s")
-
-    step = max(1, int(video_fps / fps_sample))
-    frames = []
-    frame_idx = 0
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if frame_idx % step == 0:
-            frames.append((frame_idx, frame.copy()))
-        frame_idx += 1
-
+    video_fps     = cap.get(cv2.CAP_PROP_FPS)
+    total_frames  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration_sec  = total_frames / video_fps if video_fps > 0 else 0
     cap.release()
-    log(f"Estratti {len(frames)} frame (1 ogni {step} frame originali)")
-    return frames
+    return video_fps, total_frames, duration_sec
 
 
 # ──────────────────────────────────────────────
 # STEP 2+3 — YOLO + BYTETRACK
 # ──────────────────────────────────────────────
-def detect_and_track(frames: list[tuple[int, np.ndarray]], yolo_model_name: str) -> dict:
+def detect_and_track_streaming(video_path: str, yolo_model_name: str,
+                               fps_sample: float, action_fps: float = 0.0) -> tuple[dict, list, int]:
     """
-    Rileva persone con YOLOv8 e traccia con ByteTrack.
+    Processa il video in streaming — un frame alla volta, zero accumulo in RAM.
     Ritorna:
-        track_data = {
-            track_id: {
-                "frames": [(frame_idx, bbox), ...],
-                "crops":  [np.ndarray, ...]    # crop per classificazione maglia
-            }
-        }
+        track_data      — dati tracking per giocatore
+        action_frames   — lista (frame_idx, frame) per analisi azioni LLM
+        total_tracked   — numero frame usati per il tracking
     """
     try:
         from ultralytics import YOLO
@@ -146,44 +123,72 @@ def detect_and_track(frames: list[tuple[int, np.ndarray]], yolo_model_name: str)
         log("ERRORE: ultralytics non installato. Esegui: pip install ultralytics")
         sys.exit(1)
 
+    video_fps, total_frames, duration_sec = get_video_info(video_path)
+    log(f"Video: {video_fps:.1f} fps, {total_frames} frame, {duration_sec/60:.1f} min")
+
+    track_step  = max(1, int(video_fps / fps_sample))
+    action_step = max(1, int(video_fps / action_fps)) if action_fps > 0 else 0
+    expected_track = total_frames // track_step
+
+    log(f"Tracking: 1/{track_step} frame (≈{fps_sample:.1f}/s) → ~{expected_track} frame")
+    if action_step:
+        log(f"Azioni LLM: 1/{action_step} frame (≈{action_fps:.3f}/s) → ~{total_frames//action_step} frame")
+
     log(f"Caricamento modello YOLO: {yolo_model_name}")
-    model = YOLO(yolo_model_name)
+    yolo = YOLO(yolo_model_name)
 
-    track_data = defaultdict(lambda: {"frames": [], "crops": []})
+    track_data    = defaultdict(lambda: {"frames": [], "crops": []})
+    action_frames = []
+    frame_idx     = 0
+    tracked_count = 0
 
-    log(f"Rilevamento + tracking su {len(frames)} frame...")
-    for i, (frame_idx, frame) in enumerate(frames):
-        if i % 20 == 0:
-            log(f"  Frame {i+1}/{len(frames)}")
+    cap = cv2.VideoCapture(video_path)
+    log("Avvio tracking in streaming...")
 
-        results = model.track(
-            frame,
-            persist=True,           # mantieni stato ByteTrack tra frame
-            classes=[0],            # classe 0 = persona
-            conf=CONF_THRESHOLD,
-            iou=IOU_THRESHOLD,
-            verbose=False
-        )
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-        if results[0].boxes is None or results[0].boxes.id is None:
-            continue
+        # Frame per azioni LLM — salva una copia ridotta
+        if action_step and frame_idx % action_step == 0:
+            small = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
+            action_frames.append((frame_idx, small))
 
-        boxes = results[0].boxes
-        for box, track_id in zip(boxes.xyxy, boxes.id.int()):
-            tid = int(track_id)
-            bbox = box.cpu().numpy()
-            crop = crop_bbox(frame, bbox)
+        # Frame per tracking YOLO
+        if frame_idx % track_step == 0:
+            tracked_count += 1
+            if tracked_count % 500 == 0:
+                pct = tracked_count / expected_track * 100
+                log(f"  Tracking {tracked_count}/{expected_track} ({pct:.0f}%)")
 
-            if crop.size == 0:
-                continue
+            results = yolo.track(
+                frame,
+                persist=True,
+                classes=[0],
+                conf=CONF_THRESHOLD,
+                iou=IOU_THRESHOLD,
+                tracker="bytetrack.yaml",
+                verbose=False
+            )
 
-            track_data[tid]["frames"].append((frame_idx, bbox.tolist()))
-            # Salva al massimo 10 crop per giocatore (per non saturare la RAM)
-            if len(track_data[tid]["crops"]) < 10:
-                track_data[tid]["crops"].append(crop)
+            if results[0].boxes is not None and results[0].boxes.id is not None:
+                boxes = results[0].boxes
+                for box, track_id in zip(boxes.xyxy, boxes.id.int()):
+                    tid  = int(track_id)
+                    bbox = box.cpu().numpy()
+                    crop = crop_bbox(frame, bbox)
+                    if crop.size == 0:
+                        continue
+                    track_data[tid]["frames"].append((frame_idx, bbox.tolist()))
+                    if len(track_data[tid]["crops"]) < 10:
+                        track_data[tid]["crops"].append(crop)
 
-    log(f"Tracciati {len(track_data)} ID unici")
-    return dict(track_data)
+        frame_idx += 1
+
+    cap.release()
+    log(f"Streaming completato — {len(track_data)} ID unici, {len(action_frames)} frame azioni")
+    return dict(track_data), action_frames, tracked_count
 
 
 # ──────────────────────────────────────────────
@@ -245,37 +250,88 @@ def classify_jersey(crops: list[np.ndarray]) -> str:
 # ──────────────────────────────────────────────
 def aggregate_stats(track_data: dict, total_frames: int, fps_sample: float) -> list[dict]:
     """
-    Per ogni track_id calcola:
-    - squadra (bianca/colorata)
-    - frame_count, presenza_sec (tempo in campo)
-    - posizione media in campo (normalizzata 0-1)
-    - mobilità (deviazione standard posizione)
-    - rappresentante crop per l'analisi LLM
+    Per ogni track_id calcola metriche calcistiche derivate dal tracking:
+    - presenza e continuità (quanto è rimasto in campo)
+    - zona prevalente e ampiezza di copertura
+    - mobilità e velocità media di spostamento
+    - attività offensiva/difensiva (tempo nelle rispettive metà campo)
+    - costanza (presenza continua vs apparizioni sporadiche)
     """
     players = []
 
     for tid, data in track_data.items():
-        if len(data["frames"]) < 3:  # ignora tracce troppo brevi (rumore)
+        if len(data["frames"]) < 8:
             continue
 
         squadra = classify_jersey(data["crops"])
         frame_count = len(data["frames"])
         presenza_sec = frame_count / fps_sample
 
-        # Posizione media normalizzata (centro del bounding box)
+        # Posizioni nel tempo (ordinate per frame)
+        frames_sorted = sorted(data["frames"], key=lambda x: x[0])
         positions = []
-        for _, bbox in data["frames"]:
+        frame_indices = []
+        for fidx, bbox in frames_sorted:
             x1, y1, x2, y2 = bbox
             cx = (x1 + x2) / 2
             cy = (y1 + y2) / 2
             positions.append((cx, cy))
+            frame_indices.append(fidx)
 
         pos_arr = np.array(positions)
         avg_x = float(np.mean(pos_arr[:, 0]))
         avg_y = float(np.mean(pos_arr[:, 1]))
+
+        # Mobilità totale (std posizione)
         mobility = float(np.std(pos_arr[:, 0]) + np.std(pos_arr[:, 1]))
 
-        # Scegli il crop migliore (il più grande) come rappresentante
+        # Velocità media frame-to-frame (spostamento in pixel/frame)
+        if len(pos_arr) > 1:
+            deltas = np.linalg.norm(np.diff(pos_arr, axis=0), axis=1)
+            avg_speed = float(np.mean(deltas))
+            max_speed = float(np.max(deltas))
+        else:
+            avg_speed = 0.0
+            max_speed = 0.0
+
+        # Copertura del campo: area del rettangolo minimo che racchiude le posizioni
+        if len(pos_arr) > 2:
+            x_range = float(np.max(pos_arr[:, 0]) - np.min(pos_arr[:, 0]))
+            y_range = float(np.max(pos_arr[:, 1]) - np.min(pos_arr[:, 1]))
+            campo_coperto = round(x_range * y_range / 1000, 1)  # in unità relative
+        else:
+            campo_coperto = 0.0
+
+        # Tempo in zona offensiva vs difensiva
+        # y bassa = zona alta del frame = solitamente offensiva (dipende dall'orientamento)
+        zona_off  = sum(1 for p in positions if p[1] < np.percentile(pos_arr[:, 1], 33))
+        zona_dif  = sum(1 for p in positions if p[1] > np.percentile(pos_arr[:, 1], 66))
+        zona_cen  = frame_count - zona_off - zona_dif
+        perc_off  = round(zona_off / frame_count * 100)
+        perc_dif  = round(zona_dif / frame_count * 100)
+        perc_cen  = round(zona_cen / frame_count * 100)
+
+        # Costanza: quanti "blocchi continui" di presenza (meno blocchi = più continuo)
+        if len(frame_indices) > 1:
+            gaps = [frame_indices[i+1] - frame_indices[i] for i in range(len(frame_indices)-1)]
+            n_interruzioni = sum(1 for g in gaps if g > fps_sample * 5)  # gap > 5 secondi
+        else:
+            n_interruzioni = 0
+        costanza = "alta" if n_interruzioni == 0 else "media" if n_interruzioni <= 2 else "bassa"
+
+        # Ruolo inferito dalla posizione media e mobilità
+        if mobility > 200 and perc_cen > 40:
+            ruolo_inferito = "centrocampista (mezzala)"
+        elif perc_off > 45:
+            ruolo_inferito = "attaccante"
+        elif perc_dif > 45:
+            ruolo_inferito = "difensore"
+        elif mobility > 150:
+            ruolo_inferito = "centrocampista"
+        else:
+            ruolo_inferito = "centrocampista / jolly"
+
+        # Crop migliore
         best_crop = None
         best_area = 0
         for crop in data["crops"]:
@@ -285,17 +341,25 @@ def aggregate_stats(track_data: dict, total_frames: int, fps_sample: float) -> l
                 best_crop = crop
 
         players.append({
-            "track_id":    tid,
-            "squadra":     squadra,
-            "frame_count": frame_count,
-            "presenza_sec": round(presenza_sec, 1),
-            "avg_x":       round(avg_x, 1),
-            "avg_y":       round(avg_y, 1),
-            "mobility":    round(mobility, 1),
-            "best_crop":   best_crop,
+            "track_id":       tid,
+            "squadra":        squadra,
+            "frame_count":    frame_count,
+            "presenza_sec":   round(presenza_sec, 1),
+            "avg_x":          round(avg_x, 1),
+            "avg_y":          round(avg_y, 1),
+            "mobility":       round(mobility, 1),
+            "avg_speed":      round(avg_speed, 2),
+            "max_speed":      round(max_speed, 2),
+            "campo_coperto":  campo_coperto,
+            "perc_off":       perc_off,
+            "perc_dif":       perc_dif,
+            "perc_cen":       perc_cen,
+            "costanza":       costanza,
+            "n_interruzioni": n_interruzioni,
+            "ruolo_inferito": ruolo_inferito,
+            "best_crop":      best_crop,
         })
 
-    # Ordina per tempo di presenza decrescente
     players.sort(key=lambda p: p["presenza_sec"], reverse=True)
     log(f"Giocatori validi: {len(players)} (bianca: {sum(1 for p in players if p['squadra']=='bianca')}, colorata: {sum(1 for p in players if p['squadra']=='colorata')})")
     return players
@@ -304,35 +368,250 @@ def aggregate_stats(track_data: dict, total_frames: int, fps_sample: float) -> l
 # ──────────────────────────────────────────────
 # STEP 6 — VALUTAZIONE CON QWEN2-VL VIA OLLAMA
 # ──────────────────────────────────────────────
+
+def unload_model(ollama_url: str, model: str):
+    """Forza Ollama a scaricare il modello dalla VRAM dopo ogni inferenza."""
+    try:
+        requests.post(
+            f"{ollama_url}/api/generate",
+            json={"model": model, "keep_alive": 0},
+            timeout=10
+        )
+    except Exception:
+        pass  # non bloccante
+
+
+# ──────────────────────────────────────────────
+# STEP 5b — ANALISI AZIONI FRAME PER FRAME
+# ──────────────────────────────────────────────
+ACTION_PROMPT = """Sei un analista di calcetto amatoriale. Guarda questo frame di una partita.
+
+Identifica SOLO azioni tecniche visibili in questo preciso momento:
+- PASSAGGIO: un giocatore sta passando la palla a un compagno
+- TIRO: un giocatore sta calciando verso la porta
+- TACKLE: un giocatore sta contrastando un avversario
+- GOL: la palla è in rete o un giocatore sta esultando
+- POSSESSO: un giocatore controlla la palla
+- CONTRASTO_AEREO: due giocatori saltano per il pallone
+- NESSUNA: nessuna azione tecnica visibile (giocatori in movimento libero)
+
+Per ogni azione visibile rispondi in questo formato JSON, nient'altro:
+{"azioni": [{"tipo": "TIPO_AZIONE", "zona": "sinistra|centro|destra", "meta_campo": "offensiva|difensiva|centrale", "maglia": "bianca|colorata|incerto"}]}
+
+Se non vedi azioni tecniche: {"azioni": []}"""
+
+def analyze_actions(frames: list[tuple[int, np.ndarray]],
+                    track_data: dict,
+                    ollama_url: str, model: str,
+                    n_frames: int = 30,
+                    use_vision: bool = True) -> dict:
+    """
+    Analizza N frame campionati dall'intero video per rilevare azioni tecniche.
+    Associa ogni azione al giocatore più vicino alla zona dell'azione.
+    Ritorna:
+        action_stats = {
+            track_id: {
+                "passaggi": int, "tiri": int, "tackle": int,
+                "gol": int, "possesso": int, "contrasti_aerei": int
+            }
+        }
+    """
+    if not use_vision:
+        log("Analisi azioni saltata (--no-vision attivo)")
+        return {}
+
+    # Campiona N frame distribuiti uniformemente
+    step = max(1, len(frames) // n_frames)
+    sampled = frames[::step][:n_frames]
+    log(f"Analisi azioni su {len(sampled)} frame con {model}...")
+
+    # Mappa frame_idx -> {track_id: (cx, cy)} per associazione spaziale
+    frame_positions = {}
+    for tid, data in track_data.items():
+        for fidx, bbox in data["frames"]:
+            x1, y1, x2, y2 = bbox
+            cx, cy = (x1+x2)/2, (y1+y2)/2
+            if fidx not in frame_positions:
+                frame_positions[fidx] = {}
+            frame_positions[fidx][tid] = (cx, cy)
+
+    # Contatori azioni per track_id
+    action_stats = defaultdict(lambda: {
+        "passaggi": 0, "tiri": 0, "tackle": 0,
+        "gol": 0, "possesso": 0, "contrasti_aerei": 0
+    })
+
+    ACTION_MAP = {
+        "PASSAGGIO":        "passaggi",
+        "TIRO":             "tiri",
+        "TACKLE":           "tackle",
+        "GOL":              "gol",
+        "POSSESSO":         "possesso",
+        "CONTRASTO_AEREO":  "contrasti_aerei",
+    }
+
+    # Dimensioni frame per normalizzare zona -> coordinate approssimative
+    sample_frame = sampled[0][1]
+    frame_h, frame_w = sample_frame.shape[:2]
+
+    for i, (fidx, frame) in enumerate(sampled):
+        if i % 10 == 0:
+            log(f"  Azioni frame {i+1}/{len(sampled)}...")
+
+        image_b64 = frame_to_base64(frame, max_side=768)
+
+        payload = {
+            "model": model,
+            "prompt": ACTION_PROMPT,
+            "images": [image_b64],
+            "stream": False,
+            "options": {"temperature": 0.1, "num_predict": 300, "num_ctx": 2048}
+        }
+
+        try:
+            resp = requests.post(f"{ollama_url}/api/generate", json=payload, timeout=120)
+            if resp.status_code != 200:
+                time.sleep(8)
+                continue
+            raw = resp.json().get("response", "").strip()
+
+            # Pulizia JSON (il modello a volte aggiunge testo prima/dopo)
+            start = raw.find("{")
+            end   = raw.rfind("}") + 1
+            if start == -1 or end == 0:
+                time.sleep(4)
+                continue
+            data_json = json.loads(raw[start:end])
+            azioni = data_json.get("azioni", [])
+
+        except (json.JSONDecodeError, Exception):
+            time.sleep(4)
+            continue
+
+        # Associa ogni azione al giocatore più vicino alla zona
+        players_in_frame = frame_positions.get(fidx, {})
+        if not players_in_frame:
+            # Usa frame adiacenti se questo non ha tracking
+            for delta in [-1, 1, -2, 2]:
+                players_in_frame = frame_positions.get(fidx + delta, {})
+                if players_in_frame:
+                    break
+
+        for azione in azioni:
+            tipo = azione.get("tipo", "").upper()
+            if tipo not in ACTION_MAP or tipo == "NESSUNA":
+                continue
+
+            zona       = azione.get("zona", "centro")
+            meta_campo = azione.get("meta_campo", "centrale")
+            maglia     = azione.get("maglia", "incerto")
+
+            # Stima coordinate della zona dell'azione
+            zone_x = {"sinistra": frame_w * 0.2, "centro": frame_w * 0.5, "destra": frame_w * 0.8}.get(zona, frame_w * 0.5)
+            zone_y = {"offensiva": frame_h * 0.2, "centrale": frame_h * 0.5, "difensiva": frame_h * 0.8}.get(meta_campo, frame_h * 0.5)
+
+            # Trova il giocatore più vicino alla zona, con filtro maglia
+            best_tid  = None
+            best_dist = float("inf")
+
+            for tid, (cx, cy) in players_in_frame.items():
+                dist = ((cx - zone_x)**2 + (cy - zone_y)**2) ** 0.5
+                if dist < best_dist:
+                    best_dist = dist
+                    best_tid  = tid
+
+            if best_tid is not None and best_dist < frame_w * 0.4:
+                action_stats[best_tid][ACTION_MAP[tipo]] += 1
+
+        unload_model(ollama_url, model)
+        time.sleep(3)
+
+    # Riepilogo
+    total_actions = sum(sum(v.values()) for v in action_stats.values())
+    log(f"Azioni rilevate totali: {total_actions} su {len(sampled)} frame")
+    return dict(action_stats)
+
 def build_prompt(player: dict, player_index: int, total_players: int) -> str:
     """
-    Costruisce il prompt per Qwen2-VL.
+    Costruisce il prompt con metriche calcistiche complete.
     """
-    zona = "offensiva" if player["avg_y"] < 0.4 else "difensiva" if player["avg_y"] > 0.6 else "centrale"
-    mobilita_desc = "alta" if player["mobility"] > 150 else "media" if player["mobility"] > 80 else "bassa"
+    presenza_min = int(player["presenza_sec"] // 60)
+    presenza_sec_r = int(player["presenza_sec"] % 60)
+    presenza_fmt = f"{presenza_min}m {presenza_sec_r}s" if presenza_min > 0 else f"{presenza_sec_r}s"
 
-    return f"""Sei un talent scout di calcetto amatoriale. Stai analizzando il giocatore {player_index} di {total_players}.
+    mobilita_desc = (
+        "molto alta — giocatore in costante movimento"  if player["mobility"] > 250 else
+        "alta — buona copertura del campo"              if player["mobility"] > 150 else
+        "media — movimenti selettivi"                   if player["mobility"] > 80  else
+        "bassa — giocatore statico"
+    )
 
-Dati oggettivi rilevati automaticamente dal video:
-- Squadra: {player["squadra"]}
-- Tempo in campo: {player["presenza_sec"]} secondi
-- Zona prevalente: {zona}
-- Mobilità (movimento): {mobilita_desc}
+    velocita_desc = (
+        "veloce — scatti frequenti"    if player["avg_speed"] > 15 else
+        "nella media"                  if player["avg_speed"] > 7  else
+        "lento — ritmo compassato"
+    )
 
-Nell'immagine allegata vedi un frame del giocatore durante la partita.
+    copertura_desc = (
+        "ampia — copre gran parte del campo"  if player["campo_coperto"] > 50 else
+        "media"                               if player["campo_coperto"] > 20 else
+        "ristretta — agisce in zona limitata"
+    )
 
-Basandoti sull'immagine e sui dati forniti, scrivi in italiano:
-1. VOTO: un numero da 1 a 10 (solo il numero, sulla prima riga)
-2. COMMENTO: 2-3 frasi di descrizione della performance, citando posizione in campo, dinamismo e qualsiasi dettaglio visibile nell'immagine
+    # Sezione azioni tecniche (se disponibili)
+    actions = player.get("actions", {})
+    if actions and any(v > 0 for v in actions.values()):
+        azioni_str = "\n".join([
+            f"  Passaggi:         {actions.get('passaggi', 0)}",
+            f"  Tiri in porta:    {actions.get('tiri', 0)}",
+            f"  Tackle difensivi: {actions.get('tackle', 0)}",
+            f"  Gol/esultanze:    {actions.get('gol', 0)}",
+            f"  Possesso palla:   {actions.get('possesso', 0)}",
+            f"  Contrasti aerei:  {actions.get('contrasti_aerei', 0)}",
+        ])
+        totale_azioni = sum(actions.values())
+        azioni_section = f"""
+Azioni tecniche rilevate (totale: {totale_azioni}):
+{azioni_str}"""
+    else:
+        azioni_section = "\nAzioni tecniche: nessuna rilevata nei frame analizzati"
 
-Formato risposta (rispetta esattamente):
-VOTO: <numero>
-COMMENTO: <testo>"""
+    return f"""Sei un commentatore esperto di calcetto amatoriale. Analizza la performance del giocatore {player_index} di {total_players} basandoti ESCLUSIVAMENTE sui dati rilevati dal video.
+
+═══ DATI OGGETTIVI ═══
+Squadra:          {player["squadra"]}
+Ruolo inferito:   {player["ruolo_inferito"]}
+Tempo in campo:   {presenza_fmt}
+Costanza:         {player["costanza"]} ({player["n_interruzioni"]} interruzioni)
+
+Distribuzione per zona:
+  Offensiva:  {player["perc_off"]}% del tempo
+  Centrale:   {player["perc_cen"]}% del tempo
+  Difensiva:  {player["perc_dif"]}% del tempo
+
+Mobilità:         {mobilita_desc} (indice: {player["mobility"]:.0f})
+Velocità media:   {velocita_desc} ({player["avg_speed"]:.1f} px/frame)
+Velocità massima: {player["max_speed"]:.1f} px/frame
+Copertura campo:  {copertura_desc} (indice: {player["campo_coperto"]:.0f})
+{azioni_section}
+═══════════════════════
+
+Scrivi in italiano una valutazione calcistica realistica. Considera:
+- Le azioni tecniche (passaggi, tiri, tackle) sono il fattore PIÙ IMPORTANTE
+- Un giocatore con molti passaggi e tackle merita voto alto anche se poco mobile
+- Zero azioni tecniche con alta mobilità = 5-6 (tanto movimento, poco contributo)
+- Gol o tiri = bonus significativo sul voto
+- La costanza premia chi è sempre in campo senza interruzioni
+
+Formato risposta (rispetta ESATTAMENTE, nessun testo prima):
+VOTO: <numero intero da 1 a 10>
+COMMENTO: <2-3 frasi in italiano che citano PRIMA le azioni tecniche poi mobilità e zona>"""
 
 
 def evaluate_player_with_llm(player: dict, player_index: int, total_players: int,
                                ollama_url: str, model: str,
-                               max_retries: int = 3, pause_sec: float = 4.0) -> tuple[float, str]:
+                               max_retries: int = 3, pause_sec: float = 15.0,
+                               use_vision: bool = True) -> tuple[float, str]:
     """
     Invia crop + prompt a Qwen2-VL via Ollama.
     - Immagine ridimensionata a 512px per ridurre il carico in RAM
@@ -344,19 +623,23 @@ def evaluate_player_with_llm(player: dict, player_index: int, total_players: int
         return 5.0, "Nessuna immagine disponibile per la valutazione."
 
     prompt = build_prompt(player, player_index, total_players)
-    image_b64 = frame_to_base64(player["best_crop"], max_side=512)
+    if use_vision and player["best_crop"] is not None:
+        image_b64 = frame_to_base64(player["best_crop"], max_side=512)
+    else:
+        image_b64 = None
 
     payload = {
         "model": model,
         "prompt": prompt,
-        "images": [image_b64],
         "stream": False,
         "options": {
             "temperature": 0.3,
             "num_predict": 200,
-            "num_ctx": 2048       # contesto ridotto = meno RAM
+            "num_ctx": 2048
         }
     }
+    if image_b64:
+        payload["images"] = [image_b64]
 
     last_error = ""
     for attempt in range(1, max_retries + 1):
@@ -369,7 +652,7 @@ def evaluate_player_with_llm(player: dict, player_index: int, total_players: int
 
             # 500 = Ollama sotto pressione — aspetta e riprova
             if resp.status_code == 500:
-                wait = pause_sec * attempt  # backoff: 4s, 8s, 12s
+                wait = pause_sec * attempt  # backoff: 8s, 16s, 24s
                 log(f"    500 Server Error (tentativo {attempt}/{max_retries}) — attendo {wait:.0f}s...")
                 time.sleep(wait)
                 last_error = f"500 dopo {max_retries} tentativi"
@@ -393,7 +676,8 @@ def evaluate_player_with_llm(player: dict, player_index: int, total_players: int
                 elif line.upper().startswith("COMMENTO:"):
                     commento = line.split(":", 1)[1].strip()
 
-            # Pausa dopo ogni chiamata andata a buon fine
+            # Scarica il modello dalla VRAM e aspetta che la memoria si liberi
+            unload_model(ollama_url, model)
             time.sleep(pause_sec)
             return voto, commento
 
@@ -520,15 +804,21 @@ def filter_by_player_count(players: list[dict], expected: int) -> list[dict]:
 def main():
     parser = argparse.ArgumentParser(description="Analisi video calcetto con AI")
     parser.add_argument("--video",   required=True,               help="Percorso del video (.mp4/.mov)")
-    parser.add_argument("--fps",     type=float, default=DEFAULT_FPS_SAMPLE,   help="Frame al secondo da analizzare (default: 1)")
+    parser.add_argument("--fps",     type=float, default=DEFAULT_FPS_SAMPLE,
+                        help="Frame al secondo per il tracking YOLO (default: 1). Aumenta per video lunghi (es. 10)")
+    parser.add_argument("--action-fps", type=float, default=0.033,
+                        help="Frame al secondo per analisi azioni LLM (default: 0.033 = 1 frame ogni 30s)")
     parser.add_argument("--yolo",    default=DEFAULT_YOLO_MODEL,  help="Modello YOLO (default: yolov8n.pt)")
     parser.add_argument("--model",   default=DEFAULT_OLLAMA_MODEL, help="Modello Ollama (default: qwen2.5vl:7b)")
     parser.add_argument("--ollama",  default=DEFAULT_OLLAMA_URL,  help="URL Ollama (default: http://localhost:11434)")
     parser.add_argument("--output",  default="output",            help="Cartella output (default: ./output)")
     parser.add_argument("--no-llm",  action="store_true",         help="Salta la valutazione LLM (solo tracking)")
     parser.add_argument("--max-players", type=int, default=20,    help="Max giocatori da valutare con LLM (default: 20)")
+    parser.add_argument("--no-vision", action="store_true",
+                        help="Usa solo dati statistici senza inviare immagini (più leggero, compatibile con llama3.2)")
     parser.add_argument("--players", type=int, default=None,
                         help="Numero TOTALE di giocatori in campo (es. 10 per 5v5). Filtra i falsi positivi.")
+
     args = parser.parse_args()
 
     if not os.path.exists(args.video):
@@ -538,14 +828,15 @@ def main():
     video_name = Path(args.video).stem
     start_time = time.time()
 
-    # ── STEP 1: Estrazione frame
-    frames = extract_frames(args.video, args.fps)
-
-    # ── STEP 2+3: YOLO + ByteTrack
-    track_data = detect_and_track(frames, args.yolo)
+    # ── STEP 1+2+3: Tracking in streaming (nessun accumulo RAM)
+    action_fps_val = args.action_fps if not args.no_vision else 0.0
+    track_data, action_frames_list, total_frames = detect_and_track_streaming(
+        args.video, args.yolo,
+        fps_sample=args.fps,
+        action_fps=action_fps_val
+    )
 
     # ── STEP 4+5: Classificazione + aggregazione
-    total_frames = len(frames)
     players = aggregate_stats(track_data, total_frames, args.fps)
 
     if not players:
@@ -570,6 +861,27 @@ def main():
         print(f"{p['track_id']:>4}  {p['squadra']:12} {p['presenza_sec']:>7.0f}s  {zona:12} {mob:>9}")
     print("="*55 + "\n")
 
+    # ── STEP 5b: Analisi azioni frame per frame
+    if not args.no_llm and not args.no_vision:
+        action_stats = analyze_actions(
+            action_frames_list, track_data,
+            args.ollama, args.model,
+            n_frames=len(action_frames_list),
+            use_vision=True
+        )
+        # Inietta le azioni nei dati dei giocatori
+        for p in players:
+            p["actions"] = action_stats.get(p["track_id"], {})
+        # Stampa riepilogo azioni
+        log("Azioni per giocatore:")
+        for p in players:
+            a = p.get("actions", {})
+            if any(v > 0 for v in a.values()):
+                log(f"  Track {p['track_id']}: pass={a.get('passaggi',0)} tiri={a.get('tiri',0)} tackle={a.get('tackle',0)} gol={a.get('gol',0)}")
+    else:
+        for p in players:
+            p["actions"] = {}
+
     # ── STEP 6: Valutazione LLM
     if not args.no_llm:
         log(f"Avvio valutazione con {args.model} (max {args.max_players} giocatori)...")
@@ -578,7 +890,8 @@ def main():
         for i, player in enumerate(candidates, 1):
             log(f"  Valuto giocatore {i}/{len(candidates)} (track_id={player['track_id']}, squadra={player['squadra']})")
             voto, commento = evaluate_player_with_llm(
-                player, i, len(candidates), args.ollama, args.model
+                player, i, len(candidates), args.ollama, args.model,
+                use_vision=not args.no_vision
             )
             player["voto"]    = voto
             player["commento"] = commento

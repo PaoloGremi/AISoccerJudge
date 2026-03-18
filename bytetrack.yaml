@@ -1,0 +1,8 @@
+# ByteTrack config completo per ultralytics 8.4.x
+tracker_type: bytetrack
+track_high_thresh: 0.6
+track_low_thresh: 0.3
+new_track_thresh: 0.6
+track_buffer: 60
+match_thresh: 0.85
+fuse_score: True
